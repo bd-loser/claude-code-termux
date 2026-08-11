@@ -52,6 +52,7 @@ command -v pkg >/dev/null 2>&1 || die "'pkg' not found — is this really Termux
 NEEDED=()
 command -v node >/dev/null 2>&1 || NEEDED+=(nodejs)
 command -v curl >/dev/null 2>&1 || NEEDED+=(curl)
+command -v cc >/dev/null 2>&1 || NEEDED+=(clang)
 [ -d "$APP_PREFIX/glibc/lib" ]  || NEEDED+=(glibc-runner)
 [ -x "$APP_PREFIX/glibc/bin/gcc" ] || NEEDED+=(gcc-glibc)
 

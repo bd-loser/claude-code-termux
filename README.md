@@ -176,10 +176,10 @@ hand:
 then `build-shim`.
 
 **`-G: cannot open shared object file`** from `grep` or `find` inside a session
-— Claude Code's shell snapshot defines wrapper functions that re-invoke
-`$CLAUDE_CODE_EXECPATH`. Unset, it defaults to `argv[0]`, which here is the
-glibc loader rather than the binary. The launcher pins it; you'll only see this
-if you invoke `claude-native` directly instead of going through the launcher.
+— Claude Code's shell snapshot re-invokes `$CLAUDE_CODE_EXECPATH` with a custom
+`argv[0]` to select its embedded tools. The installer builds a tiny Bionic
+launcher that preserves that tool name while invoking Termux's glibc loader,
+so tool flags reach ugrep/bfs instead of being parsed by the dynamic loader.
 
 **Version drift after `npm update`** — `claude-code-termux update`.
 

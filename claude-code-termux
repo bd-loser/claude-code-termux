@@ -60,6 +60,8 @@ MANAGER_LINK="$(dirname "$LAUNCHER")/claude-code-termux"
 SHIM_SRC_NAME="shim_dns.c"
 SHIM_BUILD_NAME="build-shim.sh"
 SHIM_DEST="${CLAUDE_DNS_SHIM:-$APP_PREFIX/lib/claude-dns-shim.so}"
+EXEC_SRC_NAME="claude-exec.c"
+EXEC_DEST="$MANAGER_HOME/claude-exec"
 
 # Colors (disabled when not a TTY, so output is pipe-friendly).
 if [ -t 1 ]; then
@@ -160,6 +162,7 @@ check_deps() {
   DEPS_CHECKED=1
   command -v node >/dev/null 2>&1 || die "node not found. Install: pkg install nodejs"
   command -v npm  >/dev/null 2>&1 || die "npm not found."
+  command -v cc >/dev/null 2>&1 || die "C compiler not found. Install: pkg install clang"
   command -v grun >/dev/null 2>&1 || glibc_ld >/dev/null 2>&1 || {
     err "glibc-runner not found. The Claude binary needs a glibc runtime."
     err "Install with: pkg install glibc-runner"
@@ -170,6 +173,15 @@ check_deps() {
     err "Reinstall glibc: pkg install glibc-runner"
     exit 1
   }
+}
+
+build_exec_shim() {
+  local src="$SELF_DIR/$EXEC_SRC_NAME"
+  [ -f "$src" ] || die "embedded-tool launcher source not found: $src"
+  mkdir -p "$MANAGER_HOME"
+  cc -O2 -Wall -Wextra -o "$EXEC_DEST.tmp" "$src"
+  mv -f "$EXEC_DEST.tmp" "$EXEC_DEST"
+  chmod 755 "$EXEC_DEST"
 }
 
 # Warn if the launcher's directory isn't on PATH. Without this a fresh user
@@ -228,7 +240,7 @@ install_manager_copy() {
   if [ "$SELF" != "$MANAGER_DEST" ]; then
     cp -f "$SELF" "$MANAGER_DEST" && chmod 755 "$MANAGER_DEST"
   fi
-  for f in "$SHIM_SRC_NAME" "$SHIM_BUILD_NAME"; do
+  for f in "$SHIM_SRC_NAME" "$SHIM_BUILD_NAME" "$EXEC_SRC_NAME"; do
     [ -f "$SELF_DIR/$f" ] && cp -f "$SELF_DIR/$f" "$MANAGER_HOME/$f" 2>/dev/null || true
   done
   chmod 755 "$MANAGER_HOME/$SHIM_BUILD_NAME" 2>/dev/null || true
@@ -280,21 +292,21 @@ set -euo pipefail
 BIN="\${CLAUDE_NATIVE:-$BIN_DEST}"
 GLIBCLIB="\${GLIBC_LIB_DIR:-$libdir}"
 GLIBCLD="\${GLIBC_LD:-$ld}"
+export CLAUDE_NATIVE="\$BIN" GLIBC_LIB_DIR="\$GLIBCLIB" GLIBC_LD="\$GLIBCLD"
 # DNS shim: this ROM's /etc -> /system/etc is read-only and has no
 # resolv.conf, so glibc's resolver has zero nameservers and every lookup
 # fails with "getaddrinfo ENOTIMP". The shim provides its own getaddrinfo
 # fallback. Only active when the file exists.
 DNS_SHIM="\${CLAUDE_DNS_SHIM:-$SHIM_DEST}"
+export CLAUDE_DNS_SHIM="\$DNS_SHIM"
 PRELOAD_ARGS=()
 if [ -f "\$DNS_SHIM" ]; then
   PRELOAD_ARGS=(--preload "\$DNS_SHIM")
 fi
-# Claude Code's shell snapshot defines wrapper functions (grep, find, ...) that
-# re-invoke \$CLAUDE_CODE_EXECPATH. Left unset it defaults to argv[0], which is
-# the glibc loader here (we exec ld.so, not the binary) — so the wrapper runs
-# 'ld.so -G pattern' and dies with "-G: cannot open shared object file".
-# Pin it to this launcher so those wrappers re-enter through us.
-export CLAUDE_CODE_EXECPATH="$LAUNCHER"
+# Claude's grep/find wrappers re-exec this path with argv[0] set to ugrep/bfs.
+# It must be the native shim: a shell launcher loses the custom argv[0], while
+# exposing ld.so makes the loader interpret tool flags such as -G as libraries.
+export CLAUDE_CODE_EXECPATH="$EXEC_DEST"
 # Self-heal via the managed copy of the manager, not wherever it was run from
 # the first time: that could have been a clone, /tmp, or a curl|bash shell.
 MANAGER="\${CLAUDE_TERMUX_MANAGER:-$MANAGER_DEST}"
@@ -345,6 +357,8 @@ cmd_install() {
   # path at it, so it has to exist before the launcher is written.
   install_manager_copy
   ok "Manager installed at $MANAGER_DEST"
+  build_exec_shim
+  ok "Embedded-tool launcher installed at $EXEC_DEST"
 
   # The shim is only needed where glibc has no resolver config at all. Building
   # it unconditionally would waste a compile on most devices.
@@ -423,6 +437,10 @@ cmd_uninstall() {
     rm -f "$SHIM_DEST"; log "Removed DNS shim: $SHIM_DEST"; removed=1
   fi
 
+  if [ -f "$EXEC_DEST" ]; then
+    rm -f "$EXEC_DEST"; log "Removed embedded-tool launcher: $EXEC_DEST"; removed=1
+  fi
+
   # Only remove the symlink if it points into our own manager home — never a
   # user's own file of the same name.
   if [ -L "$MANAGER_LINK" ] && [ "$(readlink -f "$MANAGER_LINK")" = "$(readlink -f "$MANAGER_DEST")" ]; then
@@ -455,6 +473,7 @@ cmd_doctor() {
   # deps
   command -v node >/dev/null 2>&1 && ok "node: $(node --version)" || err "node: MISSING"
   command -v npm  >/dev/null 2>&1 && ok "npm: $(npm --version)"   || err "npm: MISSING"
+  command -v cc >/dev/null 2>&1 && ok "C compiler: present"        || err "C compiler: MISSING"
   command -v grun >/dev/null 2>&1 && ok "grun: present"            || warn "grun: not on PATH"
 
   # arch
@@ -525,6 +544,17 @@ cmd_doctor() {
       ok "run check: $(run_native_cap "$BIN_DEST" --version 2>/dev/null)"
     else
       err "run check: binary failed to execute"
+    fi
+
+    # Match the wrapper generated in ~/.claude/shell-snapshots: argv[0]
+    # selects the embedded tool, and -G is ugrep's compatibility mode.
+    if [ -x "$EXEC_DEST" ] && env -u LD_PRELOAD -u LD_LIBRARY_PATH \
+      CLAUDE_NATIVE="$BIN_DEST" GLIBC_LD="$(glibc_ld)" GLIBC_LIB_DIR="$(glibc_lib_dir)" \
+      CLAUDE_DNS_SHIM="$SHIM_DEST" bash -c \
+      'exec -a ugrep "$1" -G -q "Claude Code" "$2"' _ "$EXEC_DEST" "$SELF"; then
+      ok "embedded grep: working"
+    else
+      err "embedded grep: FAILED (binary interpreter/argv0 dispatch is broken)"
     fi
   fi
 
