@@ -24,6 +24,14 @@
 
 set -euo pipefail
 
+# Cross-libc compiles must never inherit a host LD_PRELOAD/LD_LIBRARY_PATH:
+# the glibc gcc/ld will then try to load whatever the surrounding Termux
+# environment preloads (often a bionic object or a text linker script such
+# as libc.so) and die with "invalid ELF header" before compiling anything.
+# GitHub issue #1: build-shim failing for exactly this reason left users
+# without the DNS shim, which then manifested as login DNS timeouts.
+unset LD_PRELOAD LD_LIBRARY_PATH
+
 APP_PREFIX="${APP_PREFIX:-/data/data/com.termux/files/usr}"
 GLIBC_PREFIX="${GLIBC_PREFIX:-$APP_PREFIX/glibc}"
 SRC="$(dirname "$(readlink -f "$0")")/shim_dns.c"

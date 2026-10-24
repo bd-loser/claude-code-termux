@@ -6,11 +6,21 @@
  * lookup fails outright ("getaddrinfo ENOTIMP"), so the glibc build of Claude
  * Code cannot reach the API even though the network is up.
  *
- * This LD_PRELOAD shim wraps getaddrinfo(). The real implementation runs
- * first, so a working system resolver keeps its normal behaviour (/etc/hosts,
- * IPv6, NSS). Only when it fails do we fall back to a minimal UDP DNS client
- * that reads nameservers from the Termux-writable resolv.conf (or the built-in
- * public defaults) and resolves A records itself.
+ * This LD_PRELOAD shim does two things:
+ *
+ *   1. It wraps getaddrinfo(). The real implementation runs first, so a
+ *      working system resolver keeps its normal behaviour (/etc/hosts,
+ *      IPv6, NSS). Only when it fails do we fall back to a minimal UDP DNS
+ *      client that reads nameservers from the Termux-writable resolv.conf
+ *      (or the built-in public defaults) and resolves A records itself.
+ *
+ *   2. It redirects reads of /etc/resolv.conf to the Termux-writable copy.
+ *      Claude Code 2.x runs on Bun, and Bun's resolver (and anything else
+ *      that parses resolv.conf directly, e.g. c-ares-based code) opens the
+ *      file itself instead of calling getaddrinfo — with no file, such
+ *      resolvers silently fall back to 127.0.0.1 and every connection
+ *      times out. Hooking open/openat/fopen/stat transparently hands those
+ *      readers the generated config under $PREFIX/etc.
  *
  * Deliberately small: A records only, no search domains, no TCP retry, no
  * EDNS. It exists to make one HTTPS client work, not to replace libresolv.
@@ -22,6 +32,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdarg.h>
@@ -30,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -254,6 +266,219 @@ static uint16_t resolve_port(const char *service)
 	if (!strcmp(service, "http"))
 		return 80;
 	return 0;
+}
+
+/* ---------------------------------------------------------------------
+ * resolv.conf redirection.
+ *
+ * Bun's resolver and other libc-independent resolvers open
+ * /etc/resolv.conf themselves; on ROMs without the file they fall back
+ * to 127.0.0.1 and time out. Interposing the open/read calls and handing
+ * back the Termux-writable copy fixes those readers the same way the
+ * getaddrinfo wrapper above fixes glibc ones.
+ */
+
+static const char *redirect_target(void)
+{
+	static const char *cached;
+	if (cached)
+		return cached;
+	const char *env = getenv("CLAUDE_DNS_RESOLV_CONF");
+	if (env && *env && access(env, R_OK) == 0) {
+		cached = env;
+		return cached;
+	}
+	if (access(SHIM_RESOLV_CONF, R_OK) == 0) {
+		cached = SHIM_RESOLV_CONF;
+		return cached;
+	}
+	return NULL;                       /* nothing usable — don't redirect */
+}
+
+static int is_etc_resolv(const char *path)
+{
+	return path && !strcmp(path, "/etc/resolv.conf");
+}
+
+/* open with variadic mode — needs hand-rolling, macros can't expand it. */
+typedef int (*open_fn)(const char *, int, ...);
+static open_fn open_real(void)
+{
+	static open_fn cached;
+	if (!cached)
+		cached = (open_fn)dlsym(RTLD_NEXT, "open");
+	return cached;
+}
+
+int open(const char *path, int flags, ...)
+{
+	mode_t mode = 0;
+	if (flags & (O_CREAT | O_TMPFILE)) {
+		va_list ap;
+		va_start(ap, flags);
+		mode = (mode_t)va_arg(ap, int);
+		va_end(ap);
+	}
+	const char *r = is_etc_resolv(path) ? redirect_target() : NULL;
+	if (r) {
+		dlog("redirected open(\"%s\") -> \"%s\"", path, r);
+		return open_real()(r, flags, mode);
+	}
+	return open_real()(path, flags, mode);
+}
+
+typedef int (*open64_fn)(const char *, int, ...);
+static open64_fn open64_real(void)
+{
+	static open64_fn cached;
+	if (!cached)
+		cached = (open64_fn)dlsym(RTLD_NEXT, "open64");
+	return cached ? cached : (open64_fn)open_real();
+}
+
+int open64(const char *path, int flags, ...)
+{
+	mode_t mode = 0;
+	if (flags & (O_CREAT | O_TMPFILE)) {
+		va_list ap;
+		va_start(ap, flags);
+		mode = (mode_t)va_arg(ap, int);
+		va_end(ap);
+	}
+	const char *r = is_etc_resolv(path) ? redirect_target() : NULL;
+	if (r) {
+		dlog("redirected open64(\"%s\") -> \"%s\"", path, r);
+		return open64_real()(r, flags, mode);
+	}
+	return open64_real()(path, flags, mode);
+}
+
+typedef int (*openat_fn)(int, const char *, int, ...);
+static openat_fn openat_real(void)
+{
+	static openat_fn cached;
+	if (!cached)
+		cached = (openat_fn)dlsym(RTLD_NEXT, "openat");
+	return cached;
+}
+
+int openat(int dirfd, const char *path, int flags, ...)
+{
+	mode_t mode = 0;
+	if (flags & (O_CREAT | O_TMPFILE)) {
+		va_list ap;
+		va_start(ap, flags);
+		mode = (mode_t)va_arg(ap, int);
+		va_end(ap);
+	}
+	const char *r = is_etc_resolv(path) ? redirect_target() : NULL;
+	if (r) {
+		dlog("redirected openat(\"%s\") -> \"%s\"", path, r);
+		return openat_real()(dirfd, r, flags, mode);
+	}
+	return openat_real()(dirfd, path, flags, mode);
+}
+
+typedef int (*openat64_fn)(int, const char *, int, ...);
+static openat64_fn openat64_real(void)
+{
+	static openat64_fn cached;
+	if (!cached)
+		cached = (openat64_fn)dlsym(RTLD_NEXT, "openat64");
+	return cached ? cached : (openat64_fn)openat_real();
+}
+
+int openat64(int dirfd, const char *path, int flags, ...)
+{
+	mode_t mode = 0;
+	if (flags & (O_CREAT | O_TMPFILE)) {
+		va_list ap;
+		va_start(ap, flags);
+		mode = (mode_t)va_arg(ap, int);
+		va_end(ap);
+	}
+	const char *r = is_etc_resolv(path) ? redirect_target() : NULL;
+	if (r) {
+		dlog("redirected openat64(\"%s\") -> \"%s\"", path, r);
+		return openat64_real()(dirfd, r, flags, mode);
+	}
+	return openat64_real()(dirfd, path, flags, mode);
+}
+
+typedef FILE *(*fopen_fn)(const char *, const char *);
+static fopen_fn fopen_real(void)
+{
+	static fopen_fn cached;
+	if (!cached)
+		cached = (fopen_fn)dlsym(RTLD_NEXT, "fopen");
+	return cached;
+}
+
+FILE *fopen(const char *path, const char *mode)
+{
+	const char *r = is_etc_resolv(path) ? redirect_target() : NULL;
+	if (r) {
+		dlog("redirected fopen(\"%s\") -> \"%s\"", path, r);
+		return fopen_real()(r, mode);
+	}
+	return fopen_real()(path, mode);
+}
+
+typedef FILE *(*fopen64_fn)(const char *, const char *);
+static fopen64_fn fopen64_real(void)
+{
+	static fopen64_fn cached;
+	if (!cached)
+		cached = (fopen64_fn)dlsym(RTLD_NEXT, "fopen64");
+	return cached ? cached : (fopen64_fn)fopen_real();
+}
+
+FILE *fopen64(const char *path, const char *mode)
+{
+	const char *r = is_etc_resolv(path) ? redirect_target() : NULL;
+	if (r) {
+		dlog("redirected fopen64(\"%s\") -> \"%s\"", path, r);
+		return fopen64_real()(r, mode);
+	}
+	return fopen64_real()(path, mode);
+}
+
+typedef int (*stat_fn)(const char *, struct stat *);
+static stat_fn stat_real(void)
+{
+	static stat_fn cached;
+	if (!cached)
+		cached = (stat_fn)dlsym(RTLD_NEXT, "stat");
+	return cached;
+}
+
+int stat(const char *path, struct stat *buf)
+{
+	const char *r = is_etc_resolv(path) ? redirect_target() : NULL;
+	if (r) {
+		dlog("redirected stat(\"%s\") -> \"%s\"", path, r);
+		return stat_real()(r, buf);
+	}
+	return stat_real()(path, buf);
+}
+
+typedef int (*stat64_fn)(const char *, struct stat64 *);
+static stat64_fn stat64_real(void)
+{
+	static stat64_fn cached;
+	if (!cached)
+		cached = (stat64_fn)dlsym(RTLD_NEXT, "stat64");
+	return cached;
+}
+
+int stat64(const char *path, struct stat64 *buf)
+{
+	const char *r = is_etc_resolv(path) ? redirect_target() : NULL;
+	if (r) {
+		dlog("redirected stat64(\"%s\") -> \"%s\"", path, r);
+		return stat64_real()(r, buf);
+	}
+	return stat64_real()(path, buf);
 }
 
 /* Build the addrinfo chain glibc would have returned. */
