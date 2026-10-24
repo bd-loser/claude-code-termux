@@ -344,10 +344,6 @@ export CLAUDE_NATIVE="\$BIN" GLIBC_LIB_DIR="\$GLIBCLIB" GLIBC_LD="\$GLIBCLD"
   if [ -f "\$DNS_SHIM" ]; then
     PRELOAD_ARGS=(--preload "\$DNS_SHIM")
   fi
-  # Keep the managed resolv.conf alive before every run: /etc is read-only
-  # or absent on many ROMs, and both glibc (127.0.0.1 default) and Bun's
-  # built-in resolver (via the shim's redirect) depend on this file.
-  [ -x "\$MANAGER" ] && "\$MANAGER" ensure-resolv >/dev/null 2>&1 || true
 # Claude's grep/find wrappers re-exec this path with argv[0] set to ugrep/bfs.
 # It must be the native shim: a shell launcher loses the custom argv[0], while
 # exposing ld.so makes the loader interpret tool flags such as -G as libraries.
@@ -369,6 +365,11 @@ if [ ! -f "\$BIN" ] || grep -qI . "\$BIN" 2>/dev/null; then
   fi
   exit 127
 fi
+# Keep the managed resolv.conf alive before every run: /etc is read-only
+# or absent on many ROMs, and both glibc (127.0.0.1 default) and Bun's
+# built-in resolver (via the shim's redirect) depend on this file.
+# Must run after MANAGER is defined, above — set -u makes earlier uses fatal.
+[ -x "\$MANAGER" ] && "\$MANAGER" ensure-resolv >/dev/null 2>&1 || true
 exec env -u LD_PRELOAD -u LD_LIBRARY_PATH "\$GLIBCLD" --library-path "\$GLIBCLIB" "\${PRELOAD_ARGS[@]}" "\$BIN" "\$@"
 LAUNCHER_EOF
   chmod 755 "$LAUNCHER"
